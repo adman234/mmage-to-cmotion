@@ -58,9 +58,10 @@ public sealed class SerialTransport(string portName) : ITransport
                 DataReceived?.Invoke(buf, n);
             }
         }
-        catch (Exception e) when (!_closing)
+        catch (Exception e)
         {
-            Closed?.Invoke(e.Message);
+            // Closing the port from Dispose ends the blocked read with an exception too.
+            if (!_closing) Closed?.Invoke(e.Message);
             return;
         }
         if (!_closing) Closed?.Invoke("The serial port was closed.");
