@@ -31,9 +31,17 @@ public sealed class SerialTransport(string portName) : ITransport
     public void Open()
     {
         _port.Open();
-        _port.DtrEnable = false;
-        Thread.Sleep(100);
-        _port.DtrEnable = true;
+        try
+        {
+            _port.DtrEnable = false;
+            Thread.Sleep(100);
+            _port.DtrEnable = true;
+        }
+        catch (IOException)
+        {
+            // Some adapters and virtual ports have no modem control lines. The soft
+            // reset sent after opening restarts the controller either way.
+        }
         _reader = new Thread(ReadLoop) { IsBackground = true, Name = "serial-read" };
         _reader.Start();
     }

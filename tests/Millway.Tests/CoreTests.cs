@@ -83,6 +83,38 @@ public class ProgramTests
         Assert.Throws<InvalidDataException>(() => GcodeProgram.Parse("t.nc", ["(nothing)", ""]));
 }
 
+public class SerialTests
+{
+    /// <summary>
+    /// Exercises the real serial transport on Linux through a pseudo-terminal pair.
+    /// The workflow creates the pair with socat and names both ends in MILLWAY_PTY.
+    /// </summary>
+    [Fact]
+    public async Task SerialTransportTalksThroughAPseudoTerminal()
+    {
+        var spec = Environment.GetEnvironmentVariable("MILLWAY_PTY");
+        if (string.IsNullOrEmpty(spec)) return; // only meaningful where the pair exists
+        var ends = spec.Split(',');
+        using var far = new FileStream(ends[1], FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite, 1, false);
+        using var t = new SerialTransport(ends[0]);
+        using var client = new GrblClient(t);
+        client.Open();
+
+        var sent = client.SendAsync("G0 X1");
+        var buf = new byte[64];
+        int n = 0;
+        while (n < 6) n += await far.ReadAsync(buf.AsMemory(n)).AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("G0 X1\n", System.Text.Encoding.ASCII.GetString(buf, 0, n));
+
+        far.Write("ok\r\n<Idle|MPos:1.000,0.000,0.000|FS:0,0>\r\n"u8);
+        far.Flush();
+        Assert.True((await sent.WaitAsync(TimeSpan.FromSeconds(5))).Ok);
+        var end = DateTime.UtcNow.AddSeconds(5);
+        while (client.Status == null && DateTime.UtcNow < end) await Task.Delay(20);
+        Assert.Equal(1, client.Status!.MachinePos.X);
+    }
+}
+
 public class DefinitionTests
 {
     [Fact]

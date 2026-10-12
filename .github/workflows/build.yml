@@ -21,6 +21,13 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
+      - name: Create a serial port pair
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq socat
+          socat -d -d pty,raw,echo=0,link=/tmp/mw-a pty,raw,echo=0,link=/tmp/mw-b &
+          sleep 1
+          echo "MILLWAY_PTY=/tmp/mw-a,/tmp/mw-b" >> "$GITHUB_ENV"
       - run: dotnet test -c Release --nologo
 
   package:

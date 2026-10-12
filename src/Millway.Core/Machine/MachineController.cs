@@ -97,6 +97,9 @@ public sealed class MachineController : IDisposable
             PortName = transport.Name;
 
             string welcome;
+            // Raising DTR restarts some controllers on its own, so a second banner
+            // can follow the one our reset produces. Neither is a fault.
+            _expectReset = true;
             try
             {
                 var w = client.WaitForWelcomeAsync(TimeSpan.FromSeconds(5));
@@ -112,7 +115,8 @@ public sealed class MachineController : IDisposable
             if (double.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture) < 1.1)
                 throw new GrblException("GRBL versions prior to 1.1 are not supported.");
 
-            await Task.Delay(100).ConfigureAwait(false); // let the unlock message arrive
+            await Task.Delay(500).ConfigureAwait(false); // let a second banner and the unlock message arrive
+            _expectReset = false;
             client.StartPolling();
             await ReadGrblSettingsAsync().ConfigureAwait(false);
             Homed = false;
@@ -128,6 +132,7 @@ public sealed class MachineController : IDisposable
         }
         catch
         {
+            _expectReset = false;
             client.Dispose();
             _client = null;
             SetState(MachineState.Disconnected);
