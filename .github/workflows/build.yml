@@ -1,0 +1,124 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: dotnet test -c Release --nologo
+
+  package:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Version
+        id: v
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else echo "version=0.0.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"; fi
+      - name: Publish
+        shell: bash
+        run: |
+          for rid in win-x64 linux-x64 linux-arm64; do
+            dotnet publish src/Millway.App -c Release -r $rid --self-contained true \
+              -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true \
+              -p:DebugType=none -p:Version=${{ steps.v.outputs.version }} -o publish/$rid --nologo
+          done
+      - name: Windows installer
+        shell: pwsh
+        run: |
+          $inno = "${env:ProgramFiles(x86)}\Inno Setup 6"
+          if (-not (Test-Path "$inno\ISCC.exe")) { choco install innosetup -y --no-progress }
+          & "$inno\ISCC.exe" "/DAppVersion=${{ steps.v.outputs.version }}" "/DSourceDir=..\publish\win-x64" packaging\millway.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path publish\win-x64\* -DestinationPath "dist\Millway-${{ steps.v.outputs.version }}-windows-x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+      - name: Pack Linux builds
+        shell: bash
+        run: tar -cf linux-publish.tar -C publish linux-x64 linux-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-publish
+          path: linux-publish.tar
+
+  linux-packages:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-publish
+      - name: Version
+        id: v
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else echo "version=0.0.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"; fi
+      - name: Build packages
+        run: |
+          mkdir publish && tar -xf linux-publish.tar -C publish
+          v=${{ steps.v.outputs.version }}
+          for pair in linux-x64:amd64 linux-arm64:arm64; do
+            rid=${pair%%:*}; arch=${pair##*:}
+            sh packaging/build-deb.sh publish/$rid "$v" "$arch" dist
+            stage=$(mktemp -d)/millway-$v-$rid
+            mkdir -p "$stage/app"
+            cp -r publish/$rid/. "$stage/app/"
+            cp packaging/install.sh packaging/millway.desktop packaging/icon.png packaging/70-millway.rules "$stage/"
+            chmod 755 "$stage/install.sh" "$stage/app/millway"
+            tar -C "$(dirname "$stage")" -czf "dist/millway-$v-$rid.tar.gz" "$(basename "$stage")"
+          done
+          ls -l dist
+      - name: Check the package installs and starts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ./dist/millway_*_amd64.deb
+          millway --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [package, linux-packages]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "Millway ${GITHUB_REF_NAME#v}" --generate-notes --prerelease

@@ -283,5 +283,14 @@ public sealed class CarbideRemoteServer(JobInbox inbox, Allowlist allow) : TcpJo
         Inbox.Add(new ReceivedJob(name == "" ? "remote.nc" : name, remote, DateTime.Now, lines, true, ""));
         Say($"Received \"{name}\" ({lines.Count} lines) from {remote}");
         await stream.WriteAsync("GCODE_ACK\n"u8.ToArray()).ConfigureAwait(false);
+        // Closing with unread input would reset the connection and could lose the
+        // acknowledgement, so finish sending and swallow whatever the sender adds.
+        client.Client.Shutdown(SocketShutdown.Send);
+        using var cts = new CancellationTokenSource(1000);
+        try
+        {
+            while (await stream.ReadAsync(body.AsMemory(0, Math.Min(body.Length, 256)), cts.Token).ConfigureAwait(false) > 0) { }
+        }
+        catch (OperationCanceledException) { }
     }
 }

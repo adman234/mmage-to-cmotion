@@ -5,13 +5,14 @@ using Avalonia.Themes.Fluent;
 
 namespace Millway.App;
 
-public sealed record Options(bool Simulate, bool FullScreen, string? OpenFile, string? SettingsPath, (int W, int H)? Size, string Page = "run")
+public sealed record Options(bool Simulate, bool FullScreen, string? OpenFile, string? SettingsPath, (int W, int H)? Size, string Page = "run", double SimSpeed = 1)
 {
     public static Options Parse(string[] args)
     {
         bool sim = false, full = false;
         string? open = null, settings = null;
         string page = "run";
+        double speed = 1;
         (int, int)? size = null;
         for (int i = 0; i < args.Length; i++)
         {
@@ -21,6 +22,7 @@ public sealed record Options(bool Simulate, bool FullScreen, string? OpenFile, s
             else if (a == "--open" && i + 1 < args.Length) open = args[++i];
             else if (a == "--settings" && i + 1 < args.Length) settings = args[++i];
             else if (a.StartsWith("--page=")) page = a[7..];
+            else if (a.StartsWith("--sim-speed=")) double.TryParse(a[12..], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out speed);
             else if (a.StartsWith("--size="))
             {
                 var p = a[7..].Split('x');
@@ -28,7 +30,7 @@ public sealed record Options(bool Simulate, bool FullScreen, string? OpenFile, s
             }
             else if (!a.StartsWith('-') && File.Exists(a)) open = a;
         }
-        return new Options(sim, full, open, settings, size, page);
+        return new Options(sim, full, open, settings, size, page, speed <= 0 ? 1 : speed);
     }
 }
 

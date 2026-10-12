@@ -1,0 +1,3 @@
+# Lets the logged-in user open Carbide 3D controllers (USB vendor 16d0) without
+# being in the dialout group, and keeps ModemManager from probing them.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="16d0", TAG+="uaccess", GROUP="dialout", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"

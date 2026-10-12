@@ -54,6 +54,10 @@ public sealed class MainWindow : Window
     double _jogStep = 1;   // mm; 0 means continuous
     Action? _refreshPane;
 
+    internal MachineController Machine => _mc;
+    internal GrblSimulator? Simulator { get; private set; }
+    internal AppSettings Settings => _settings;
+
     public MainWindow(Options options)
     {
         _options = options;
@@ -68,6 +72,7 @@ public sealed class MainWindow : Window
         });
 
         Title = "Millway";
+        Icon = new WindowIcon(Avalonia.Platform.AssetLoader.Open(new Uri("avares://millway/Assets/icon.png")));
         Width = options.Size?.W ?? 1180;
         Height = options.Size?.H ?? 760;
         MinWidth = 900;
@@ -370,7 +375,8 @@ public sealed class MainWindow : Window
 
     async Task ConnectSimulatorAsync()
     {
-        var sim = new GrblSimulator { TimeScale = 1, ProbeTriggerZ = -70 };
+        var sim = new GrblSimulator { TimeScale = _options.SimSpeed, ProbeTriggerZ = -70 };
+        Simulator = sim;
         await Task.Run(() => _mc.ConnectAsync(sim));
         await AfterConnectAsync();
     }
@@ -457,7 +463,7 @@ public sealed class MainWindow : Window
         if (files.Count > 0 && files[0].TryGetLocalPath() is { } path) LoadFile(path);
     }
 
-    void LoadFile(string path)
+    internal void LoadFile(string path)
     {
         try { _mc.LoadJob(GcodeProgram.Load(path)); }
         catch (Exception e) when (e is IOException or InvalidDataException or UnauthorizedAccessException)

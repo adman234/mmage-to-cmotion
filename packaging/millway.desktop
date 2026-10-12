@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Millway
+Comment=CNC machine control for GRBL routers
+Exec=/opt/millway/millway %f
+Icon=millway
+Terminal=false
+Categories=Engineering;Utility;
+MimeType=text/x-gcode;
