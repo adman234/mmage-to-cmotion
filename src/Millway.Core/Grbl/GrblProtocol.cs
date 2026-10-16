@@ -133,6 +133,21 @@ public static partial class GrblText
     [GeneratedRegex(@"^error:\s?(\d+)$")]
     public static partial Regex Error();
 
+    public static string SettingName(int n) => n switch
+    {
+        0 => "step pulse", 1 => "step idle delay", 2 => "step port invert", 3 => "direction invert",
+        4 => "step enable invert", 5 => "limit pins invert", 6 => "probe pin invert", 10 => "status report",
+        11 => "junction deviation", 12 => "arc tolerance", 13 => "report inches", 20 => "soft limits",
+        21 => "hard limits", 22 => "homing cycle", 23 => "homing direction", 24 => "homing feed",
+        25 => "homing seek", 26 => "homing debounce", 27 => "homing pull-off", 30 => "max spindle speed",
+        31 => "min spindle speed", 32 => "laser mode",
+        100 => "X steps/mm", 101 => "Y steps/mm", 102 => "Z steps/mm",
+        110 => "X max rate", 111 => "Y max rate", 112 => "Z max rate",
+        120 => "X acceleration", 121 => "Y acceleration", 122 => "Z acceleration",
+        130 => "X max travel", 131 => "Y max travel", 132 => "Z max travel",
+        _ => "setting",
+    };
+
     public static string ErrorText(int code) => code switch
     {
         1 => "G-code words consist of a letter and a value. Letter was not found.",

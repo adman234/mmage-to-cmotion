@@ -317,7 +317,7 @@ public sealed class MainWindow : Window
 
         // Rebuild the pane only when what it shows has to change.
         bool running = _mc.State is MachineState.Running or MachineState.Paused;
-        string key = $"{_page}|{_mc.State}|{_mc.Job?.Name}|{_mc.Job?.Loaded.Ticks}|{_inbox.Jobs.Count}|{_mc.Homed}|{_settings.Inches}";
+        string key = $"{_page}|{_mc.State}|{_settings.BitSetterLocated}|{_mc.ConfigDifferences.Count}|{_mc.Job?.Name}|{_mc.Job?.Loaded.Ticks}|{_inbox.Jobs.Count}|{_mc.Homed}|{_settings.Inches}";
         if (key != _shownKey)
         {
             _shownKey = key;
@@ -387,8 +387,23 @@ public sealed class MainWindow : Window
         {
             await PromptAsync(new Prompt("Machine Setup", "No configuration found for the attached machine.\nPlease choose your machine in Settings.", "OK"));
             _page = "settings";
+            return;
         }
+        var diffs = _mc.ConfigDifferences;
+        if (diffs.Count > 0)
+        {
+            AddLog("Controller settings that differ from the Carbide 3D configuration: " + string.Join("; ", diffs));
+            await PromptAsync(new Prompt("Controller Settings Differ",
+                $"These settings on the controller are not what Carbide 3D sets for a {_settings.Model.Name} {_settings.Size?.Name} {ZName(_settings.ZType)}:\n\n"
+                + string.Join("\n", diffs.Take(10)) + (diffs.Count > 10 ? $"\n...and {diffs.Count - 10} more" : "")
+                + "\n\nIf the machine type above is right, use Settings > SEND CONFIGURATION TO MACHINE to restore the vendor values. The current settings are backed up first.",
+                "OK"));
+        }
+        if (_settings.BitSetterEnabled && !_settings.BitSetterLocated)
+            await PromptAsync(new Prompt("BitSetter Location", "The BitSetter location has not been confirmed for this machine.\n\nAfter initializing, go to Settings > Tooling, press MOVE TO BITSETTER DEFAULT, jog over the centre of the BitSetter and press SAVE BITSETTER LOCATION.", "OK"));
     }
+
+    static string ZName(ZAxisType z) => z switch { ZAxisType.BeltDrive => "Belt-drive Z", ZAxisType.ZPlus => "Z-Plus", _ => "HDZ" };
 
     // ---- idle / job ---------------------------------------------------------------
 
@@ -588,13 +603,17 @@ public sealed class MainWindow : Window
         {
             var b = Btn(label, () => { }, minWidth: 90, height: 90);
             ((TextBlock)b.Content!).FontSize = 22;
+            // While a continuous jog is held, keep telling the controller the button is
+            // still down. If the release is ever missed, the jog stops by itself.
+            var alive = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
+            alive.Tick += (_, _) => _mc.KeepJogAlive();
             b.AddHandler(PointerPressedEvent, (_, e) =>
             {
                 double fast = axis == 2 ? 1000 : 4000;
-                if (_jogStep == 0) _mc.StartJog(axis, dir, fast);
+                if (_jogStep == 0) { _mc.StartJog(axis, dir, fast); alive.Start(); }
                 else _mc.JogStep(axis, dir, _jogStep, _jogStep >= 1 ? fast : 500);
             }, RoutingStrategies.Tunnel);
-            void Stop() { if (_jogStep == 0) _mc.StopJog(); }
+            void Stop() { alive.Stop(); if (_jogStep == 0) _mc.StopJog(); }
             b.AddHandler(PointerReleasedEvent, (_, _) => Stop(), RoutingStrategies.Tunnel);
             b.PointerCaptureLost += (_, _) => Stop();
             return b;
@@ -778,10 +797,15 @@ public sealed class MainWindow : Window
         TextBox Number(double value, Action<double> set)
         {
             var t = new TextBox { Text = value.ToString("0.###", CultureInfo.InvariantCulture), Width = 140, HorizontalAlignment = HorizontalAlignment.Left };
-            t.LostFocus += (_, _) =>
+            // Save on every valid edit, so a value typed just before closing is not lost.
+            t.TextChanged += (_, _) =>
             {
                 if (double.TryParse(t.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var v)) { set(v); _settings.Save(); }
-                else t.Text = value.ToString("0.###", CultureInfo.InvariantCulture);
+            };
+            t.LostFocus += (_, _) =>
+            {
+                if (!double.TryParse(t.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out _))
+                    t.Text = value.ToString("0.###", CultureInfo.InvariantCulture);
             };
             return t;
         }
@@ -796,6 +820,8 @@ public sealed class MainWindow : Window
             _settings.SizeName = m.Sizes.LastOrDefault()?.Name ?? "";
             if (m.ZTypes.Length > 0 && !m.ZTypes.Contains(_settings.ZType)) _settings.ZType = m.ZTypes[0];
             _settings.ConfigSent = false;
+            _settings.ResetBitSetterIfMachineChanged();
+            _mc.CompareWithVendorConfig();
             _settings.Save();
             _shownKey = "";
         };
@@ -804,26 +830,57 @@ public sealed class MainWindow : Window
         if (_settings.IsConfigured && mdl.Sizes.Length > 0)
         {
             var size = new ComboBox { ItemsSource = mdl.Sizes.Select(s => s.Name).ToList(), SelectedItem = _settings.Size?.Name, MinWidth = 240 };
-            size.SelectionChanged += (_, _) => { _settings.SizeName = (string)size.SelectedItem!; _settings.ConfigSent = false; _settings.Save(); };
+            size.SelectionChanged += (_, _) =>
+            {
+                _settings.SizeName = (string)size.SelectedItem!;
+                _settings.ResetBitSetterIfMachineChanged();
+                _settings.Save();
+                _shownKey = "";
+            };
             p.Children.Add(Row("Size", size));
         }
         if (_settings.IsConfigured && mdl.HasZChoice)
         {
-            string ZName(ZAxisType z) => z switch { ZAxisType.BeltDrive => "Belt-drive Z", ZAxisType.ZPlus => "Z-Plus", _ => "HDZ" };
             var z = new ComboBox { ItemsSource = mdl.ZTypes.Select(ZName).ToList(), SelectedItem = ZName(_settings.ZType), MinWidth = 240 };
-            z.SelectionChanged += (_, _) => { _settings.ZType = mdl.ZTypes[z.SelectedIndex]; _settings.ConfigSent = false; _settings.Save(); };
+            z.SelectionChanged += (_, _) =>
+            {
+                _settings.ZType = mdl.ZTypes[z.SelectedIndex];
+                _settings.ConfigSent = false;
+                _mc.CompareWithVendorConfig();
+                _settings.Save();
+                _shownKey = "";
+            };
             p.Children.Add(Row("Z axis", z));
         }
         if (_settings.IsConfigured && mdl.IsShapeoko)
         {
+            bool connected = _mc.State is MachineState.Idle or MachineState.NotInitialized or MachineState.Alarm;
+            var diffs = _mc.ConfigDifferences;
+            p.Children.Add(new TextBlock
+            {
+                Text = !connected ? "Connect to compare the controller with the Carbide 3D configuration."
+                    : diffs.Count == 0 ? "The controller matches the Carbide 3D configuration for this machine."
+                    : $"{diffs.Count} controller setting(s) differ from the Carbide 3D configuration:\n" + string.Join("\n", diffs),
+                Foreground = diffs.Count == 0 || !connected ? Dim : Warn, TextWrapping = TextWrapping.Wrap,
+            });
             var send = AsyncBtn("SEND CONFIGURATION TO MACHINE", async () =>
             {
-                int r = await PromptAsync(new Prompt("Send Configuration", $"This writes the GRBL settings for a {mdl.Name} {_settings.Size?.Name} to the controller, replacing what is stored there.\n\nThe machine will need to be initialized afterwards.", "Send", "Cancel"));
-                if (r == 0) await _mc.SendConfigAsync();
+                var changes = _mc.ConfigDifferences;
+                string what = changes.Count == 0
+                    ? "The controller already matches. Sending again rewrites the same values."
+                    : "These settings will change:\n" + string.Join("\n", changes.Take(12)) + (changes.Count > 12 ? $"\n...and {changes.Count - 12} more" : "");
+                int r = await PromptAsync(new Prompt("Send Configuration",
+                    $"This writes the Carbide 3D GRBL settings for a {mdl.Name} {_settings.Size?.Name} {ZName(_settings.ZType)} to the controller.\n\n{what}\n\nThe current settings are saved to a backup file first, and the machine must be initialized afterwards.",
+                    "Cancel", "Write Settings"));
+                if (r != 1) return;
+                var backup = await _mc.SendConfigAsync();
+                await PromptAsync(new Prompt("Configuration Sent", "The previous controller settings were saved to:\n" + backup + "\n\nUse RESTORE SETTINGS BACKUP to put them back.", "OK"));
             }, Accent);
-            send.IsEnabled = _mc.State is MachineState.Idle or MachineState.NotInitialized or MachineState.Alarm;
+            send.IsEnabled = connected;
             p.Children.Add(send);
-            p.Children.Add(new TextBlock { Text = _settings.ConfigSent ? "Configuration has been sent." : "Configuration has not been sent from this app. If the machine already works with other software it does not need to be.", Foreground = Dim, TextWrapping = TextWrapping.Wrap });
+            var restore = Btn("RESTORE SETTINGS BACKUP", ShowBackups);
+            restore.IsEnabled = connected && _mc.ListBackups().Count > 0;
+            p.Children.Add(restore);
         }
         p.Children.Add(new TextBlock { Text = _mc.State == MachineState.Disconnected ? "Not connected" : $"Port {_mc.PortName}   GRBL {_mc.GrblVersion}   Travel {_mc.Travel}", Foreground = Dim });
 
@@ -840,11 +897,32 @@ public sealed class MainWindow : Window
         p.Children.Add(Row("Enable BitSetter", Toggle(_settings.BitSetterEnabled, v => _settings.BitSetterEnabled = v)));
         if (_settings.BitSetterEnabled)
         {
-            p.Children.Add(Row("BitSetter X (machine mm)", Number(_settings.BitSetterX, v => _settings.BitSetterX = v)));
-            p.Children.Add(Row("BitSetter Y (machine mm)", Number(_settings.BitSetterY, v => _settings.BitSetterY = v)));
-            var here = Btn("USE CURRENT POSITION AS BITSETTER LOCATION", () => { _mc.SetBitSetterHere(); _shownKey = ""; });
-            here.IsEnabled = _mc.Homed && _mc.State == MachineState.Idle;
-            p.Children.Add(here);
+            if (_settings.ResetBitSetterIfMachineChanged()) _settings.Save();
+            p.Children.Add(new TextBlock
+            {
+                Text = (_settings.BitSetterLocated ? "Saved location" : "Not confirmed yet. Default location")
+                    + FormattableString.Invariant($": X {_settings.BitSetterX:0.000}, Y {_settings.BitSetterY:0.000} (machine mm, from the homing switches)"),
+                Foreground = _settings.BitSetterLocated ? Dim : Warn, TextWrapping = TextWrapping.Wrap,
+            });
+            bool ready = _mc.Homed && _mc.State == MachineState.Idle;
+            var toDefault = AsyncBtn("MOVE TO BITSETTER DEFAULT", () => _mc.MoveToBitSetterAsync(true));
+            var toSaved = AsyncBtn("MOVE TO SAVED BITSETTER LOCATION", () => _mc.MoveToBitSetterAsync(false));
+            var save = Btn("SAVE BITSETTER LOCATION", () =>
+            {
+                try { _mc.SaveBitSetterHere(); }
+                catch (GrblException e) { _ = PromptAsync(new Prompt("BitSetter", e.Message, "OK")); }
+                _shownKey = "";
+            }, Accent);
+            toDefault.IsEnabled = toSaved.IsEnabled = save.IsEnabled = ready;
+            toSaved.IsEnabled &= _settings.BitSetterLocated;
+            p.Children.Add(toDefault);
+            p.Children.Add(toSaved);
+            p.Children.Add(save);
+            p.Children.Add(new TextBlock
+            {
+                Text = ready ? "Move to the default, then jog (JOG page) until the cutter is over the centre of the BitSetter and save." : "Initialize the machine to set the BitSetter location.",
+                Foreground = Dim, TextWrapping = TextWrapping.Wrap,
+            });
         }
         p.Children.Add(Row("Touch plate thickness (mm)", Number(_settings.ProbeThickness, v => _settings.ProbeThickness = v)));
         p.Children.Add(Row("Manual spindle (router)", Toggle(_settings.ManualSpindle, v => _settings.ManualSpindle = v)));
@@ -871,6 +949,26 @@ public sealed class MainWindow : Window
         if (_mc.State != MachineState.Disconnected) p.Children.Add(Btn("DISCONNECT", _mc.Disconnect));
         p.Children.Add(new TextBlock { Text = "Millway " + typeof(MainWindow).Assembly.GetName().Version?.ToString(3), Foreground = Dim, Margin = new Thickness(0, 8, 0, 0) });
         return new ScrollViewer { Content = p };
+    }
+
+    void ShowBackups()
+    {
+        var list = new StackPanel { Spacing = 10, MinWidth = 560 };
+        foreach (var path in _mc.ListBackups().Take(10))
+        {
+            var file = path;
+            list.Children.Add(Btn(Path.GetFileName(file), () =>
+            {
+                ClosePanel();
+                _ = Guard(async () =>
+                {
+                    int r = await PromptAsync(new Prompt("Restore Settings",
+                        "Write every setting from this backup back to the controller?\n\n" + file + "\n\nThe machine must be initialized afterwards.", "Cancel", "Restore"));
+                    if (r == 1) await _mc.RestoreBackupAsync(file);
+                });
+            }));
+        }
+        ShowPanel("Settings Backups", list);
     }
 
     void StartServers()
@@ -902,7 +1000,7 @@ public sealed class MainWindow : Window
         }
         if (_settings.GrblTcpEnabled)
             // Ports below 1024 need extra privileges on Linux, so fall back to a high port.
-            Try(new GrblTcpServer(_inbox, allow) { Travel = () => _mc.Travel.X > 0 ? _mc.Travel : _settings.Model.IsShapeoko ? _settings.Model.Travel(_settings.ZType, _settings.Size) : new Vec3(838.2, 444.5, 95) },
+            Try(new GrblTcpServer(_inbox, allow) { Travel = () => _mc.Travel.X > 0 ? _mc.Travel : _settings.Model.IsShapeoko ? _settings.Model.Travel(_settings.Size) : new Vec3(838.2, 444.5, 95) },
                 new[] { _settings.GrblTcpPort, 2323 }.Distinct().ToArray());
         if (_settings.AllowRemoteAccess) Try(new CarbideRemoteServer(_inbox, allow), 6280);
     }

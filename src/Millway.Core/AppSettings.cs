@@ -25,9 +25,13 @@ public sealed class AppSettings
     public string LastPort { get; set; } = "";
 
     public bool BitSetterEnabled { get; set; }
-    /// <summary>BitSetter location in machine coordinates (mm).</summary>
+    /// <summary>BitSetter location in machine coordinates (mm), i.e. measured from the homing switches.</summary>
     public double BitSetterX { get; set; }
     public double BitSetterY { get; set; }
+    /// <summary>True once the operator has confirmed the BitSetter location for the current machine size.</summary>
+    public bool BitSetterLocated { get; set; }
+    /// <summary>The machine and size the BitSetter location belongs to. A different size clears it, as in Carbide Motion.</summary>
+    public string BitSetterMachine { get; set; } = "";
     /// <summary>Machine Z at which the tool that the current Z zero belongs to touched the BitSetter.</summary>
     public double? ReferenceToolZ { get; set; }
     /// <summary>Height of the touch plate above the stock surface when probing Z (mm).</summary>
@@ -94,6 +98,33 @@ public sealed class AppSettings
     [JsonIgnore] public MachineModel Model => MachineModel.ById(ModelId);
     [JsonIgnore] public SizeOption? Size => Model.Sizes.FirstOrDefault(s => s.Name == SizeName) ?? Model.Sizes.LastOrDefault();
     [JsonIgnore] public bool IsConfigured => ModelId != "";
+    /// <summary>Identifies the machine geometry the BitSetter location was set for.</summary>
+    [JsonIgnore] public string MachineKey => $"{Model.Id}/{Size?.Name}";
+
+    /// <summary>Folder for GRBL settings backups, next to the settings file.</summary>
+    [JsonIgnore] public string BackupDirectory => System.IO.Path.Combine(System.IO.Path.GetDirectoryName(Path ?? DefaultPath())!, "grbl-backups");
+
+    /// <summary>
+    /// Forgets a BitSetter location that belongs to a different machine or size and puts
+    /// it back at the vendor default for this one. Returns true if anything changed.
+    /// </summary>
+    public bool ResetBitSetterIfMachineChanged()
+    {
+        if (!IsConfigured || BitSetterMachine == MachineKey) return false;
+        if (BitSetterMachine == "" && (BitSetterX != 0 || BitSetterY != 0))
+        {
+            // A location saved by version 0.1, which did not record the machine: keep it.
+            BitSetterMachine = MachineKey;
+            BitSetterLocated = true;
+            return true;
+        }
+        var (x, y) = Model.DefaultBitSetter(Model.Travel(Size));
+        BitSetterX = x;
+        BitSetterY = y;
+        BitSetterLocated = false;
+        BitSetterMachine = MachineKey;
+        return true;
+    }
 
     public static readonly QuickAction[] BuiltInActions =
     [

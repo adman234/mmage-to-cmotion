@@ -52,6 +52,9 @@ public sealed class GrblClient : IDisposable
 
     public void Open() => _transport.Open();
 
+    /// <summary>Sets the work offset carried into status reports that omit WCO.</summary>
+    public void SeedOffsets(Vec3 wco) => _status = (_status ?? new GrblStatus()) with { Wco = wco };
+
     public void StartPolling(int intervalMs = 200)
     {
         _poll?.Dispose();

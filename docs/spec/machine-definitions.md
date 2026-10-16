@@ -1,8 +1,8 @@
 # Machine definitions
 
 Behaviour notes taken from static analysis of Carbide Motion build 667 for
-Windows (2026-08-01). These describe what the vendor software sends, so that
-Millway configures the same machines the same way. No vendor code is used.
+Windows (2026-08-01). Millway uses these values as they are, so a machine
+behaves the same under either program. No vendor code is used.
 
 ## USB identification
 
@@ -23,9 +23,28 @@ soft reset (`0x18`) is sent.
 
 A device with an unknown ID is treated as a generic GRBL machine.
 
-## Shapeoko 3, 4 and Pro configuration
+## GRBL configuration
 
-One table, with four values chosen by the Z axis fitted:
+Carbide Motion picks one of several tables by machine type. Each is listed in
+the order it is written.
+
+### Shapeoko 4 and Shapeoko Pro
+
+```
+$0=10 $1=255 $2=0 $3=5
+Z-Plus: $102=200 $112=1000 $122=270 $132=95
+HDZ:    $102=320 $112=1300 $122=100 $132=150
+$4=0 $5=0 $6=0 $10=255 $11=.02 $12=.01 $13=0 $20=0 $21=0 $22=1 $23=0
+$24=100 $25=2000 $26=25 $27=3 $30=24000 $31=0 $32=0 $100=40 $101=40
+$110=10000 $111=10000 $120=500 $121=500 $130=845 $131=850
+```
+
+Direction invert is 5 for both Z axes. Version 0.1 of Millway wrongly used the
+Shapeoko 3 value (2), which reverses all three axes on a Shapeoko 4.
+
+### Shapeoko 3
+
+Same as above except for the Z-dependent values:
 
 | Setting | Belt-drive Z | Z-Plus | HDZ |
 |---|---|---|---|
@@ -35,31 +54,28 @@ One table, with four values chosen by the Z axis fitted:
 | `$122` Z acceleration | 400 | 270 | 100 |
 | `$132` Z travel | 100 | 95 | 150 |
 
-Common to all three:
+### Shapeoko 5 Pro
 
 ```
-$0=10 $1=255 $2=0 $4=0 $5=0 $6=0 $10=255 $11=.02 $12=.01 $13=0
-$20=0 $21=0 $22=1 $23=0 $24=100 $25=2000 $26=25 $27=3
-$30=24000 $31=0 $32=0 $100=40 $101=40
-$110=10000 $111=10000 $120=500 $121=500
+$0=10 $1=255 $2=6 $3=0 $4=0 $5=15 $6=0 $10=255 $11=0.020 $12=0.002 $13=0
+$20=0 $21=0 $22=1 $23=0 $24=500.000 $25=2000.000 $26=25 $27=1.50
+$30=24000 $31=0 $32=0 $100=80.000 $101=80.000 $102=160.000
+$110=5000.000 $111=5000.000 $112=3000.000 $120=500.000 $121=500.000 $122=500.000
+$130=1250.000 $131=1250.000 $132=155.000
 ```
 
 Soft and hard limits are off; homing is on, toward the positive end of every
 axis, so machine coordinates run from `-travel` to `0`.
 
-## Shapeoko 5 Pro configuration
+On connect Millway compares the controller against the table for the selected
+machine and lists any differences. Sending the configuration first saves the
+controller's current settings to a backup file, which can be written back.
 
-```
-$0=10 $1=255 $2=6 $3=0 $4=0 $5=1 $6=0 $11=0.020 $12=0.002 $13=0
-$20=0 $21=0 $23=0 $24=500 $25=2000 $27=1.50
-$100=80 $101=80 $102=160 $110=5000 $111=5000 $112=3000
-$120=500 $121=500 $122=500
-```
+## Travel
 
-`$10`, `$22`, `$26`, `$30` to `$32` were not recovered for this model and are
-assumed equal to the Shapeoko 3/4 values.
-
-## Bed sizes
+The controller's `$130`-`$132` are written with the largest bed's values and
+are not what Carbide Motion works within. It uses the bed size chosen in its
+setup wizard:
 
 | Model | Size | X | Y | Z |
 |---|---|---|---|---|
@@ -73,6 +89,24 @@ assumed equal to the Shapeoko 3/4 values.
 | | 4x2 | 1237 | 623 | 155 |
 | | 4x4 | 1237 | 1237 | 155 |
 
+The usable machine coordinate range is `-travel` to `-1` on each axis. Jogs are
+clamped to it. Generic GRBL machines use `$130`-`$132`.
+
+## Positions derived from travel
+
+All in machine coordinates, i.e. measured from the homing switches.
+
+| Position | X | Y |
+|---|---|---|
+| BitSetter default | -100 | front + 30 |
+| Tool change without a BitSetter | -5 (Shapeoko 5 Pro: -1) | front + 20 |
+| Rapid, left / centre / right column | left + 10 / middle / -11 | |
+| Rapid, back / centre / front row | | -11 / middle + 70 / front + 70 |
+
+"front" is `-travel Y`. The BitSetter default is a starting point: the operator
+jogs over the centre of the BitSetter and saves the location. Changing the
+machine size clears a saved location, as Carbide Motion does.
+
 ## Not yet implemented
 
 Nomad 883, Nomad 3, Nomad 4, Shapeoko HDM and HDM V2 tables were located but
@@ -81,8 +115,8 @@ controller's stored settings untouched.
 
 ## Uncertain
 
-- The vendor's base table carries `$130=845 $131=850` for every Shapeoko 3/4/Pro
-  and how the size choice changes them was not traced. Millway writes the bed
-  size from the table above to `$130`/`$131` and the Z travel from the Z axis
-  table to `$132`. These only affect Millway's own bounds check, jog limits and
-  rapid positions, because soft limits are off.
+- How the bed size reaches the definition was inferred: the wizard's size rows
+  are the only per-size values in the program, and setting them clears the
+  BitSetter location. The call itself was not traced.
+- The tool change position is read from the machine definition; where Carbide
+  Motion uses it was not traced.

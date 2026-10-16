@@ -115,8 +115,8 @@ public class UiTests : IDisposable
         var centre = b.TranslatePoint(new Point(b.Bounds.Width / 2, b.Bounds.Height / 2), w)!.Value;
         w.MouseDown(centre, MouseButton.Left);
         w.MouseUp(centre, MouseButton.Left);
-        await Until(() => w.Simulator!.State == GrblState.Idle && w.Simulator.MachinePos.Y < -1.5, "jog move");
-        Assert.Equal(-2, w.Simulator!.MachinePos.Y, 2);
+        await Until(() => w.Simulator!.State == GrblState.Idle && w.Simulator.MachinePos.Y < -3.5, "jog move");
+        Assert.Equal(-4, w.Simulator!.MachinePos.Y, 2); // homed at -3, one 1 mm step
     }
 
     [AvaloniaFact]

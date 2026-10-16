@@ -10,6 +10,13 @@ public sealed record Prompt(string Title, string Message, params string[] Button
 
 public enum RapidPosition { NorthWest, North, NorthEast, West, Center, East, SouthWest, South, SouthEast }
 
+/// <summary>One GRBL setting whose value on the controller is not what the vendor configuration expects.</summary>
+public sealed record SettingDifference(int Number, string Description, double? Actual, double Expected)
+{
+    public override string ToString() => FormattableString.Invariant(
+        $"${Number} ({Description}): {(Actual is { } a ? GrblText.F(a) : "missing")}, expected {GrblText.F(Expected)}");
+}
+
 /// <summary>
 /// The machine as the operator sees it: connect, initialize, jog, zero, measure
 /// tools and run jobs. Every multi-step cycle is an async method that sends
@@ -17,25 +24,41 @@ public enum RapidPosition { NorthWest, North, NorthEast, West, Center, East, Sou
 /// </summary>
 public sealed class MachineController : IDisposable
 {
-    const double SafeZ = -5;          // machine Z used for all traverses
-    const double FastProbeFeed = 800; // BitSetter first touch, mm/min
-    const double SlowProbeFeed = 200; // BitSetter second touch
+    const double SafeZ = BitSetterCycle.SafeZ; // machine Z used for all traverses
     const double PlateProbeFeed = 100;
     const double PlateProbeTravel = 12;
+    static readonly TimeSpan JogKeepAlive = TimeSpan.FromMilliseconds(400);
 
     readonly SemaphoreSlim _gate = new(1, 1);
     readonly Dictionary<int, double> _grbl = new();
+    readonly Timer _jogWatchdog;
     GrblClient? _client;
     CancellationTokenSource? _jobCts;
     (Vec3 Pos, bool Hit)? _probe;
+    Vec3? _g54;
     Vec3? _lastPos;
     volatile string? _jobError;
     int _jobDone;
     double _spindleRpm;
     bool _expectReset;
     volatile bool _probing;
+    volatile bool _jogging;
+    long _jogAliveTicks;
+    DateTime _spindleOffAt = DateTime.MinValue;
+    bool _spindleRunning;
 
-    public MachineController(AppSettings settings) => Settings = settings;
+    void MarkSpindleOff()
+    {
+        if (!_spindleRunning) return;
+        _spindleRunning = false;
+        _spindleOffAt = DateTime.UtcNow;
+    }
+
+    public MachineController(AppSettings settings)
+    {
+        Settings = settings;
+        _jogWatchdog = new Timer(_ => CheckJogAlive(), null, 100, 100);
+    }
 
     public AppSettings Settings { get; }
     public MachineState State { get; private set; } = MachineState.Disconnected;
@@ -63,8 +86,16 @@ public sealed class MachineController : IDisposable
 
     public bool HomingEnabled => _grbl.GetValueOrDefault(22) != 0;
 
-    /// <summary>Axis travel in mm, from the controller's $130-$132.</summary>
-    public Vec3 Travel => new(_grbl.GetValueOrDefault(130), _grbl.GetValueOrDefault(131), _grbl.GetValueOrDefault(132));
+    /// <summary>
+    /// Axis travel in mm. For a known model this is the bed size, as Carbide Motion uses it;
+    /// only Generic GRBL machines fall back to the controller's $130-$132.
+    /// </summary>
+    public Vec3 Travel => Settings.Model.IsShapeoko
+        ? Settings.Model.Travel(Settings.Size)
+        : new(_grbl.GetValueOrDefault(130), _grbl.GetValueOrDefault(131), _grbl.GetValueOrDefault(132));
+
+    /// <summary>Settings on the controller that differ from the vendor configuration for the selected model.</summary>
+    public IReadOnlyList<SettingDifference> ConfigDifferences { get; private set; } = [];
 
     GrblClient Client => _client ?? throw new GrblException("Not connected.");
 
@@ -119,6 +150,9 @@ public sealed class MachineController : IDisposable
             _expectReset = false;
             client.StartPolling();
             await ReadGrblSettingsAsync().ConfigureAwait(false);
+            await ReadOffsetsAsync().ConfigureAwait(false);
+            CompareWithVendorConfig();
+            if (Settings.ResetBitSetterIfMachineChanged()) Settings.Save();
             Homed = false;
             ToolMeasured = false;
             LastError = "";
@@ -152,9 +186,58 @@ public sealed class MachineController : IDisposable
 
     async Task ReadGrblSettingsAsync()
     {
-        _grbl.Clear();
+        lock (_grbl) _grbl.Clear();
         await Client.CommandAsync("$$").ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Reads the work offsets. GRBL only includes WCO in some status reports, so without
+    /// this the offsets would read as zero for the first seconds after connecting.
+    /// </summary>
+    async Task ReadOffsetsAsync()
+    {
+        _g54 = null;
+        await Client.CommandAsync("$#").ConfigureAwait(false);
+        if (_g54 is { } g54)
+        {
+            Client.SeedOffsets(g54);
+            Status = Status with { Wco = g54 };
+        }
+    }
+
+    /// <summary>Recomputes <see cref="ConfigDifferences"/> from the settings last read.</summary>
+    public void CompareWithVendorConfig()
+    {
+        var diffs = new List<SettingDifference>();
+        foreach (var line in Settings.Model.BuildConfig(Settings.ZType))
+        {
+            var m = GrblText.Setting().Match(line);
+            if (!m.Success) continue;
+            int n = int.Parse(m.Groups[1].Value);
+            double want = double.Parse(m.Groups[2].Value, CultureInfo.InvariantCulture);
+            double? have;
+            lock (_grbl) have = _grbl.TryGetValue(n, out var v) ? v : null;
+            if (have is not { } h || Math.Abs(h - want) > 1e-6)
+                diffs.Add(new SettingDifference(n, GrblText.SettingName(n), have, want));
+        }
+        ConfigDifferences = diffs;
+    }
+
+    /// <summary>Saves the controller's current settings to a timestamped file and returns its path.</summary>
+    public string BackupGrblSettings()
+    {
+        Directory.CreateDirectory(Settings.BackupDirectory);
+        var path = Path.Combine(Settings.BackupDirectory, $"grbl-{DateTime.Now:yyyyMMdd-HHmmss}.txt");
+        List<string> lines;
+        lock (_grbl) lines = _grbl.OrderBy(k => k.Key).Select(k => $"${k.Key}={GrblText.F(k.Value)}").ToList();
+        File.WriteAllLines(path, lines);
+        return path;
+    }
+
+    public IReadOnlyList<string> ListBackups() =>
+        Directory.Exists(Settings.BackupDirectory)
+            ? Directory.GetFiles(Settings.BackupDirectory, "grbl-*.txt").OrderDescending().ToList()
+            : [];
 
     void OnLine(string line)
     {
@@ -167,7 +250,13 @@ public sealed class MachineController : IDisposable
         }
         var p = GrblText.ProbeResult().Match(line);
         if (p.Success && GrblStatus.TryVec(p.Groups[1].Value, out var pos))
+        {
             _probe = (pos, p.Groups[2].Value == "1");
+            return;
+        }
+        var o = GrblText.Offset().Match(line);
+        if (o.Success && o.Groups[1].Value == "G54" && GrblStatus.TryVec(o.Groups[2].Value, out var g54))
+            _g54 = g54;
     }
 
     void OnStatus(GrblStatus st)
@@ -286,12 +375,14 @@ public sealed class MachineController : IDisposable
         Homed = true;
         ToolMeasured = false;
         LastError = "";
-        if (Settings.BitSetterEnabled)
+        if (Settings.BitSetterEnabled && Settings.BitSetterLocated)
         {
-            int r = await PromptHandler(new Prompt("Load Tool", "Please insert a tool. It will be measured on the BitSetter.", "Resume", "Skip")).ConfigureAwait(false);
+            int r = await PromptHandler(new Prompt("Load Tool", "Please insert a tool. It will be measured on the BitSetter." + SpindleOffNote, "Resume", "Skip")).ConfigureAwait(false);
             if (r == 0) await MeasureToolCoreAsync().ConfigureAwait(false);
         }
     }, [MachineState.NotInitialized, MachineState.Idle, MachineState.Alarm]);
+
+    string SpindleOffNote => Settings.ManualSpindle ? "\n\nMake sure the spindle is switched off first." : "";
 
     // ---- BitSetter ------------------------------------------------------------------
 
@@ -304,16 +395,19 @@ public sealed class MachineController : IDisposable
 
     async Task ToolChangeCoreAsync(int tool)
     {
-        await Cmd("M5").ConfigureAwait(false);
+        if (Settings.BitSetterEnabled) RequireBitSetterLocated();
+        await SpindleOffAsync().ConfigureAwait(false);
         await Cmd($"G53 G0 Z{F(SafeZ)}").ConfigureAwait(false);
-        if (Settings.BitSetterEnabled)
-            await Cmd($"G53 G0 X{F(Settings.BitSetterX)} Y{F(Settings.BitSetterY)}").ConfigureAwait(false);
+        var (x, y) = Settings.BitSetterEnabled
+            ? (Settings.BitSetterX, Settings.BitSetterY)
+            : Settings.Model.ToolChangePosition(Travel);
+        if (Settings.BitSetterEnabled || Settings.Model.IsShapeoko)
+            await Cmd($"G53 G0 X{F(x)} Y{F(y)}").ConfigureAwait(false);
         await SyncAsync().ConfigureAwait(false);
 
         var what = tool > 0 ? $"Please insert tool #{tool}" : "Please insert a tool";
-        var note = Settings.ManualSpindle ? "\n\nMake sure the spindle is off first." : "";
         var tail = Settings.BitSetterEnabled ? "" : "\n\nWithout a BitSetter the Z zero must be set again if the tool length changed.";
-        int r = await PromptHandler(new Prompt("Tool Change Required", what + note + tail, "Resume", "Stop")).ConfigureAwait(false);
+        int r = await PromptHandler(new Prompt("Tool Change Required", what + SpindleOffNote + tail, "Resume", "Stop")).ConfigureAwait(false);
         if (r != 0) throw new OperationCanceledException("Stopped at tool change.");
         if (Settings.BitSetterEnabled) await MeasureToolCoreAsync().ConfigureAwait(false);
     }
@@ -337,15 +431,38 @@ public sealed class MachineController : IDisposable
         ToolMeasured = true;
     }
 
-    /// <summary>Two-touch probe on the BitSetter. Returns the machine Z of the slow touch.</summary>
+    void RequireBitSetterLocated()
+    {
+        if (!Settings.BitSetterLocated)
+            throw new GrblException("The BitSetter location has not been set.\n\nIn Settings, press MOVE TO BITSETTER DEFAULT, jog until the cutter is over the centre of the BitSetter, then press SAVE BITSETTER LOCATION.");
+    }
+
+    /// <summary>
+    /// Turns the spindle off and, if it was running recently, waits for it to stop the way
+    /// Carbide Motion does before touching the BitSetter.
+    /// </summary>
+    async Task SpindleOffAsync()
+    {
+        if (Status.Spindle > 0) _spindleRunning = true;
+        await Cmd("M5").ConfigureAwait(false);
+        MarkSpindleOff();
+        var remaining = BitSetterCycle.SpinDown - (DateTime.UtcNow - _spindleOffAt);
+        if (remaining > TimeSpan.Zero)
+            await Cmd($"G4 P{F(Math.Max(0.005, remaining.TotalSeconds))}").ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Two-touch probe on the BitSetter, as Carbide Motion does it: lower to Z-15, probe
+    /// down up to 150 mm fast, back off 5 mm and touch again slowly. Returns the machine Z
+    /// of the slow touch.
+    /// </summary>
     async Task<double> BitSetterProbeAsync()
     {
         if (!Settings.BitSetterEnabled) throw new GrblException("The BitSetter is not enabled.");
         RequireHomed();
-        double travelZ = Travel.Z;
-        if (travelZ <= 0) throw new GrblException("Z travel ($132) is not configured.");
+        RequireBitSetterLocated();
 
-        await Cmd("M5").ConfigureAwait(false);
+        await SpindleOffAsync().ConfigureAwait(false);
         await Cmd("G21 G90").ConfigureAwait(false);
         await Cmd($"G53 G0 Z{F(SafeZ)}").ConfigureAwait(false);
         await Cmd($"G53 G0 X{F(Settings.BitSetterX)} Y{F(Settings.BitSetterY)}").ConfigureAwait(false);
@@ -354,11 +471,15 @@ public sealed class MachineController : IDisposable
         if (st.Probe)
             throw new GrblException("BS001: The BitSetter probe is already detected as closed.\n\nThis can be caused by several things:\n- The BitSetter button is jammed down.\n- If you have a BitZero, is it touching the ground clip? (Is the red LED lit?)");
 
-        var first = await ProbeMachineZAsync(-(travelZ - 1), FastProbeFeed, st.Wco).ConfigureAwait(false)
+        await Cmd($"G53 G0 Z{F(BitSetterCycle.StartZ)}").ConfigureAwait(false);
+        await SyncAsync().ConfigureAwait(false);
+        st = await FreshStatusAsync().ConfigureAwait(false);
+
+        var first = await ProbeMachineZAsync(st.MachinePos.Z - BitSetterCycle.ProbeDistance, BitSetterCycle.FastFeed, st.Wco).ConfigureAwait(false)
             ?? throw new GrblException("BS002: The BitSetter probe did not activate while probing.\n\nThis can be caused by several things:\n- The Z axis is jammed, and was not able to reach the BitSetter.\n- The BitSetter button is jammed.\n- The BitSetter is unplugged.\n- The BitSetter is damaged.\n\nPlease ensure the BitSetter LED turns red when pressed.");
 
-        await Cmd($"G53 G0 Z{F(Math.Min(first + 5, SafeZ))}").ConfigureAwait(false);
-        var second = await ProbeMachineZAsync(first - 2, SlowProbeFeed, st.Wco).ConfigureAwait(false)
+        await Cmd($"G53 G0 Z{F(Math.Min(first + BitSetterCycle.Retract, SafeZ))}").ConfigureAwait(false);
+        var second = await ProbeMachineZAsync(first - BitSetterCycle.SlowOvershoot, BitSetterCycle.SlowFeed, st.Wco).ConfigureAwait(false)
             ?? throw new GrblException("BS003: The BitSetter probe did not activate while probing.\n\nThe second, slow touch did not find the BitSetter.");
 
         await Cmd($"G53 G0 Z{F(SafeZ)}").ConfigureAwait(false);
@@ -419,6 +540,10 @@ public sealed class MachineController : IDisposable
         if (!Settings.BitSetterEnabled || !Homed) return;
         if (!ToolMeasured)
         {
+            RequireBitSetterLocated();
+            if (Settings.ManualSpindle &&
+                await PromptHandler(new Prompt("Measure Tool", "The tool will now be measured on the BitSetter so this Z zero is kept across tool changes." + SpindleOffNote, "Measure", "Skip")).ConfigureAwait(false) != 0)
+                return;
             Settings.ReferenceToolZ = null;
             await MeasureToolCoreAsync().ConfigureAwait(false);
         }
@@ -444,38 +569,74 @@ public sealed class MachineController : IDisposable
 
     // ---- jogging --------------------------------------------------------------------
 
-    /// <summary>Starts a continuous jog toward the end of travel. Call <see cref="StopJog"/> on release.</summary>
+    /// <summary>Machine coordinate limits: from -travel to 1 mm short of the homing switches.</summary>
+    public (Vec3 Min, Vec3 Max) Extents
+    {
+        get
+        {
+            var t = Travel;
+            return (new Vec3(-t.X, -t.Y, -t.Z), new Vec3(-1, -1, -1));
+        }
+    }
+
+    bool CanJogFreely(int axis) => Homed && Travel[axis] > 0;
+
+    /// <summary>
+    /// Starts a continuous jog toward the end of travel. The caller must call
+    /// <see cref="KeepJogAlive"/> at least every 400 ms while the button is held and
+    /// <see cref="StopJog"/> on release; if the keep-alive stops, the jog is cancelled.
+    /// </summary>
     public void StartJog(int axis, int direction, double feed)
     {
         if (State != MachineState.Idle || _client == null) return;
-        if (!Homed || Travel[axis] <= 0) return; // without a known position only stepped jogs are safe
-        double target = direction > 0 ? -1 : -(Travel[axis] - 1);
+        if (!CanJogFreely(axis)) return; // without a known position only stepped jogs are safe
+        var (min, max) = Extents;
+        double target = direction > 0 ? max[axis] : min[axis];
+        KeepJogAlive();
+        _jogging = true;
         _ = Client.SendAsync($"$J=G53 G21 {"XYZ"[axis]}{F(target)} F{F(feed)}");
     }
 
-    public void StopJog() => _client?.Realtime(0x85);
+    public void KeepJogAlive() => Interlocked.Exchange(ref _jogAliveTicks, DateTime.UtcNow.Ticks);
+
+    void CheckJogAlive()
+    {
+        if (!_jogging) return;
+        if (DateTime.UtcNow.Ticks - Interlocked.Read(ref _jogAliveTicks) > JogKeepAlive.Ticks)
+        {
+            Log?.Invoke("Jog stopped: the button release was not seen.");
+            StopJog();
+        }
+    }
+
+    public void StopJog()
+    {
+        _jogging = false;
+        _client?.Realtime(0x85);
+    }
 
     public void JogStep(int axis, int direction, double distance, double feed)
     {
         if (State != MachineState.Idle || _client == null) return;
         double d = direction * distance;
-        if (Homed && Travel[axis] > 0)
+        if (CanJogFreely(axis))
         {
-            double target = Math.Clamp(Status.MachinePos[axis] + d, -(Travel[axis] - 1), -1);
+            var (min, max) = Extents;
+            double target = Math.Clamp(Status.MachinePos[axis] + d, min[axis], max[axis]);
             d = target - Status.MachinePos[axis];
             if (Math.Abs(d) < 0.0005) return;
         }
         _ = Client.SendAsync($"$J=G91 G21 {"XYZ"[axis]}{F(d)} F{F(feed)}");
     }
 
+    /// <summary>Rapids to one of the nine positions Carbide Motion offers.</summary>
     public Task RapidToAsync(RapidPosition where) => RunCycle("rapid", async () =>
     {
         RequireHomed();
         var t = Travel;
         if (t.X <= 0 || t.Y <= 0) throw new GrblException("Machine travel is not configured.");
-        int col = (int)where % 3, row = (int)where / 3; // row 0 is the back of the machine
-        double x = -t.X + 10 + (t.X - 20) * col / 2.0;
-        double y = -10 - (t.Y - 20) * row / 2.0;
+        int col = (int)where % 3 - 1, row = 1 - (int)where / 3; // NorthWest is back left
+        var (x, y) = MachineModel.RapidPosition(t, col, row);
         await Cmd($"G53 G0 Z{F(SafeZ)}").ConfigureAwait(false);
         await Cmd($"G53 G0 X{F(x)} Y{F(y)}").ConfigureAwait(false);
         await SyncAsync().ConfigureAwait(false);
@@ -489,11 +650,32 @@ public sealed class MachineController : IDisposable
         await SyncAsync().ConfigureAwait(false);
     });
 
-    /// <summary>Stores the current position as the BitSetter location.</summary>
-    public void SetBitSetterHere()
+    /// <summary>Moves to the saved BitSetter location, or the vendor default if none is saved yet.</summary>
+    public Task MoveToBitSetterAsync(bool useDefault) => RunCycle("move to BitSetter", async () =>
     {
+        RequireHomed();
+        var (x, y) = useDefault || !Settings.BitSetterLocated
+            ? Settings.Model.DefaultBitSetter(Travel)
+            : (Settings.BitSetterX, Settings.BitSetterY);
+        await SpindleOffAsync().ConfigureAwait(false);
+        await Cmd($"G53 G0 Z{F(SafeZ)}").ConfigureAwait(false);
+        await Cmd($"G53 G0 X{F(x)} Y{F(y)}").ConfigureAwait(false);
+        await SyncAsync().ConfigureAwait(false);
+    });
+
+    /// <summary>
+    /// Saves the current position as the BitSetter location. Machine coordinates are
+    /// measured from the homing switches, so the location stays valid across restarts.
+    /// </summary>
+    public void SaveBitSetterHere()
+    {
+        RequireHomed();
         Settings.BitSetterX = Math.Round(Status.MachinePos.X, 3);
         Settings.BitSetterY = Math.Round(Status.MachinePos.Y, 3);
+        Settings.BitSetterLocated = true;
+        Settings.BitSetterMachine = Settings.MachineKey;
+        Settings.ReferenceToolZ = null; // a reference measured at the old spot no longer applies
+        ToolMeasured = false;
         Settings.Save();
         Changed?.Invoke();
     }
@@ -525,19 +707,44 @@ public sealed class MachineController : IDisposable
         }).ConfigureAwait(false);
     }
 
-    /// <summary>Writes the selected model's GRBL configuration to the controller.</summary>
-    public Task SendConfigAsync() => RunCycle("send configuration", async () =>
+    /// <summary>
+    /// Writes the selected model's vendor GRBL configuration to the controller after
+    /// saving the current settings to a backup file. Returns the backup's path.
+    /// </summary>
+    public async Task<string> SendConfigAsync()
     {
-        var lines = Settings.Model.BuildConfig(Settings.ZType, Settings.Size);
-        if (lines.Count == 0) throw new GrblException("The Generic GRBL profile leaves the controller settings unchanged.");
+        string backup = "";
+        await RunCycle("send configuration", async () =>
+        {
+            var lines = Settings.Model.BuildConfig(Settings.ZType);
+            if (lines.Count == 0) throw new GrblException("The Generic GRBL profile leaves the controller settings unchanged.");
+            await ReadGrblSettingsAsync().ConfigureAwait(false);
+            backup = BackupGrblSettings();
+            Log?.Invoke("Saved the controller settings to " + backup);
+            await WriteSettingsAsync(lines).ConfigureAwait(false);
+            Settings.ConfigSent = true;
+            Settings.Save();
+        }, [MachineState.Idle, MachineState.NotInitialized, MachineState.Alarm]).ConfigureAwait(false);
+        return backup;
+    }
+
+    /// <summary>Writes every setting from a backup file back to the controller.</summary>
+    public Task RestoreBackupAsync(string path) => RunCycle("restore settings", async () =>
+    {
+        var lines = File.ReadAllLines(path).Select(l => l.Trim()).Where(l => GrblText.Setting().IsMatch(l)).ToList();
+        if (lines.Count == 0) throw new GrblException("The backup file contains no GRBL settings.");
+        await WriteSettingsAsync(lines).ConfigureAwait(false);
+    }, [MachineState.Idle, MachineState.NotInitialized, MachineState.Alarm]);
+
+    async Task WriteSettingsAsync(IEnumerable<string> lines)
+    {
         if (Status.State == GrblState.Alarm) await Cmd("$X").ConfigureAwait(false);
         foreach (var l in lines) await Cmd(l).ConfigureAwait(false);
         await ReadGrblSettingsAsync().ConfigureAwait(false);
-        Settings.ConfigSent = true;
-        Settings.Save();
+        CompareWithVendorConfig();
         Homed = false;
         SetState(HomingEnabled ? MachineState.NotInitialized : MachineState.Idle);
-    }, [MachineState.Idle, MachineState.NotInitialized, MachineState.Alarm]);
+    }
 
     // ---- jobs -----------------------------------------------------------------------
 
@@ -587,6 +794,8 @@ public sealed class MachineController : IDisposable
                 if (_jobError != null) break;
                 var line = job.Lines[i];
                 if (line.Rpm > 0) _spindleRpm = line.Rpm;
+                if (line.Kind == LineKind.SpindleOn) _spindleRunning = true;
+                else if (line.Kind is LineKind.SpindleOff or LineKind.ProgramEnd) MarkSpindleOff();
 
                 switch (line.Kind)
                 {
@@ -759,6 +968,7 @@ public sealed class MachineController : IDisposable
 
     public void Dispose()
     {
+        _jogWatchdog.Dispose();
         Disconnect();
         _gate.Dispose();
     }

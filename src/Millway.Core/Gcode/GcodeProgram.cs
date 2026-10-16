@@ -58,6 +58,7 @@ public sealed partial class GcodeProgram
         bool absolute = true, inches = false, haveMotion = false;
         int motion = 0, pendingTool = 0;
         double feed = 0, minutes = 0;
+        int plane = 17;
         Vec3 min = new(double.MaxValue, double.MaxValue, double.MaxValue), max = new(double.MinValue, double.MinValue, double.MinValue);
         const int PathCap = 200_000;
 
@@ -89,7 +90,7 @@ public sealed partial class GcodeProgram
 
             var kind = LineKind.Other;
             double rpm = 0;
-            double? x = null, y = null, z = null, i = null, j = null, r = null;
+            double? x = null, y = null, z = null, i = null, j = null, k = null, r = null;
             bool g53 = false, hasG43 = false;
             int lineMotion = -1;
             foreach (var (l, v) in words)
@@ -100,6 +101,7 @@ public sealed partial class GcodeProgram
                         switch (v)
                         {
                             case 0: case 1: case 2: case 3: motion = lineMotion = (int)v; break;
+                            case 17: case 18: case 19: plane = (int)v; break;
                             case 20: inches = true; break;
                             case 21: inches = false; break;
                             case 90: absolute = true; break;
@@ -127,6 +129,7 @@ public sealed partial class GcodeProgram
                     case 'Z': z = v; break;
                     case 'I': i = v; break;
                     case 'J': j = v; break;
+                    case 'K': k = v; break;
                     case 'R': r = v; break;
                 }
             }
@@ -140,9 +143,9 @@ public sealed partial class GcodeProgram
                     y is { } yv ? (absolute ? yv * u : pos.Y + yv * u) : pos.Y,
                     z is { } zv ? (absolute ? zv * u : pos.Z + zv * u) : pos.Z);
                 double dist;
-                if (motion >= 2 && (i != null || j != null || r != null))
+                if (motion >= 2 && (i != null || j != null || k != null || r != null))
                 {
-                    dist = ArcExtents(pos, target, (i ?? 0) * u, (j ?? 0) * u, r * u, motion == 2, Extend, path.Count < PathCap ? path : null);
+                    dist = PlaneArc(plane, pos, target, (i ?? 0) * u, (j ?? 0) * u, (k ?? 0) * u, r * u, motion == 2, Extend, path.Count < PathCap ? path : null);
                 }
                 else
                 {
@@ -185,6 +188,34 @@ public sealed partial class GcodeProgram
             Estimate = TimeSpan.FromMinutes(minutes),
             Path = path,
         };
+    }
+
+    /// <summary>
+    /// Runs an arc in any of the three planes through the XY arc walker by renaming axes,
+    /// the way GRBL selects them: G18 uses Z and X, G19 uses Y and Z.
+    /// </summary>
+    static double PlaneArc(int plane, Vec3 from, Vec3 to, double i, double j, double k, double? r, bool clockwise,
+        Action<Vec3> extend, List<(Vec3, bool)>? path)
+    {
+        if (plane == 17) return ArcExtents(from, to, i, j, r, clockwise, extend, path);
+        Func<Vec3, Vec3> toPlane, back;
+        double oa, ob;
+        if (plane == 18)
+        {
+            toPlane = v => new Vec3(v.Z, v.X, v.Y);
+            back = v => new Vec3(v.Y, v.Z, v.X);
+            (oa, ob) = (k, i);
+        }
+        else
+        {
+            toPlane = v => new Vec3(v.Y, v.Z, v.X);
+            back = v => new Vec3(v.Z, v.X, v.Y);
+            (oa, ob) = (j, k);
+        }
+        var local = path == null ? null : new List<(Vec3, bool)>();
+        double len = ArcExtents(toPlane(from), toPlane(to), oa, ob, r, clockwise, v => extend(back(v)), local);
+        if (local != null) path!.AddRange(local.Select(e => (back(e.Item1), e.Item2)));
+        return len;
     }
 
     /// <summary>Walks an XY-plane arc, reporting its extents, and returns its length.</summary>

@@ -5,8 +5,10 @@ Linux and Windows. It does the job of the vendor's machine control program on
 platforms the vendor does not support, and it accepts jobs sent over the
 network from MillMage.
 
-> **Status: untested on a real machine.** Everything here has been verified
-> against a built-in GRBL simulator only. Read [Before the first real cut](#before-the-first-real-cut)
+> **Status: early testing.** Version 0.1 was first run on a Shapeoko 4 XL and
+> got the axis directions, travel and BitSetter reach wrong. Version 0.2 uses
+> Carbide 3D's own values for all of these, but has only been checked against a
+> built-in GRBL simulator since. Read [Before the first real cut](#before-the-first-real-cut)
 > before connecting it to hardware.
 
 ## What it does
@@ -50,12 +52,16 @@ the `dialout` group and log in again.
 ## First use
 
 1. Start Millway, pick the port and press **CONNECT TO CUTTER**.
-2. In **SETTINGS**, choose the machine, size and Z axis. Only press
-   **SEND CONFIGURATION TO MACHINE** if the controller has never been set up;
-   a machine that already works with other software does not need it.
+2. In **SETTINGS**, choose the machine, size and Z axis. Millway compares the
+   controller with Carbide 3D's configuration for that machine and lists any
+   differences. **SEND CONFIGURATION TO MACHINE** writes the vendor values; it
+   saves the current ones to a backup first, which **RESTORE SETTINGS BACKUP**
+   can put back.
 3. Press **INITIALIZE MACHINE** to home.
-4. If you have a BitSetter: jog the spindle over it, then in Settings turn on
-   **Enable BitSetter** and press **USE CURRENT POSITION AS BITSETTER LOCATION**.
+4. If you have a BitSetter: in Settings turn on **Enable BitSetter**, press
+   **MOVE TO BITSETTER DEFAULT**, jog until the cutter is over the centre of
+   the BitSetter, and press **SAVE BITSETTER LOCATION**. The location is kept
+   in machine coordinates, measured from the homing switches.
 5. Load a file, set the zero from the **JOG** page, and press **START JOB**.
 
 ### Receiving jobs from MillMage

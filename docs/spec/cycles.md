@@ -22,7 +22,8 @@ Observed:
    wait, and read again. Still active: error HM001.
 2. Run the homing cycle and wait for idle.
 
-Millway does the same. The back-off is a 5 mm `$J` jog away from the homing
+Millway does the same. Rapid positions follow the vendor layout described in
+machine-definitions.md. The back-off is a 5 mm `$J` jog away from the homing
 direction on each active axis, after `$X`. After homing it sends
 `G21 G90 G54` and `G49`. With a BitSetter enabled it then asks for a tool and
 measures it.
@@ -34,19 +35,21 @@ Observed:
 1. Spindle off (`M5`). On controllers that support it, `M56 P0`.
 2. Rapid to machine `Z-5`, then to the stored BitSetter X/Y.
 3. Dwell, then check the probe input. Closed already: error BS001.
-4. Wait for the spindle to stop if it was running.
-5. Probe down at 800 mm/min. No contact: BS002. No position reported: BS006.
-6. Rapid to 5 mm above the contact point.
-7. Probe down at 200 mm/min to at most 2 mm below the first contact. No
+4. Wait for the spindle to stop: up to 4 seconds after it was switched off.
+5. Rapid down to machine `Z-15`.
+6. Probe down at 800 mm/min, up to 150 mm. No contact: BS002. No position
+   reported: BS006.
+7. Rapid to 5 mm above the contact point.
+8. Probe down at 200 mm/min to at most 2 mm below the first contact. No
    contact: BS003.
-8. Store the contact height and rapid back to machine `Z-5`.
+9. Store the contact height and rapid back to machine `Z-5`.
 
 Millway follows this, except:
 
-- `M56` is not sent (it is a vendor GRBL extension).
-- The fast probe starts from `Z-5` and may travel to 1 mm above the bottom of
-  Z travel. The vendor uses a start height and probe distance from the machine
-  definition that were not recovered.
+- `M56` is not sent. It is a vendor GRBL extension that a standard controller
+  rejects, and it only matters when parking is enabled.
+- Measuring refuses to run until the BitSetter location has been confirmed, so
+  it never probes at an unset position.
 - A failed probe leaves GRBL in alarm; Millway clears it with `$X` and retracts
   before reporting the error.
 
@@ -95,6 +98,9 @@ matches the vendor's "reset on idle hold" behaviour.
 Observed: continuous jogs are `$J=G53 ...` commands to a target, cancelled on
 release.
 
-Millway sends a `$J=G53` jog to 1 mm inside the end of travel and cancels it
-with `0x85` on release. Before the machine is homed only stepped jogs are
-offered, since an unbounded jog could run into the frame.
+Millway sends a `$J=G53` jog to the end of the usable range (`-travel` to `-1`,
+as Carbide Motion clamps) and cancels it with `0x85` on release. While the
+button is held the screen confirms it every 100 ms; if those confirmations stop
+for 400 ms the jog is cancelled, so a missed touch release cannot run the
+machine to the end of travel. Before the machine is homed only stepped jogs
+are offered.
